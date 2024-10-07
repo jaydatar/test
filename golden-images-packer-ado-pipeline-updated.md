@@ -1,6 +1,14 @@
 
 # Golden Images with Packer and Azure DevOps Pipeline
 
+Version 0.0.1
+
+Date 07/10/24
+
+| Title                     | Document Author    | Product Manager  | Iteration                                                                                                      |
+| ------------------------- | ------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------- |
+| Golden Images with Packer and Azure DevOps Pipeline | Tapan Patel| James Waterfield | [Azure 2.2](https://allenovery.visualstudio.com/Platform%20Team/_wiki/wikis/Platform-Team.wiki/7280/Azure-2.2) |
+
 ## Introduction
 Golden images are pre-configured virtual machine images that include necessary software, configurations, and security settings. Automating their creation using Packer and Azure DevOps (ADO) pipelines ensures consistency, reduces deployment time, and streamlines maintenance. In the future, integration with Ansible can further enhance configuration management.
 
@@ -14,44 +22,61 @@ This document focuses on building Linux-based golden images using Packer and aut
 ### Prerequisites
 - Packer installed on a local machine or ADO-hosted agent.
 - Access to an Azure account with appropriate permissions (Contributor or Owner).
-- A resource group and storage account for managing Packer's state.
+- A resource group and Azure Compute Gallery Instance for managing Packer images.
 
 ### Packer Template Setup
-Create a Packer template (`template.pkr.hcl`) to define the base image, provisioning steps, and image configuration:
+Create a Packer template (`ubuntu.pkr.hcl`) to define the base image, provisioning steps, and image configuration:
 
 ```hcl
 # Packer configuration for building a golden image in Azure
 
-source "azure-arm" "example" {
-  azure_tags           = {
-    "Environment" = "Production"
-  }
-  managed_image_name   = "golden-image"
-  managed_image_rg     = "packer-resource-group"
-  location             = "East US"
-  vm_size              = "Standard_D2s_v3"
+source "azure-arm" "ubuntu_20" {
+  client_id        = var.client_id
+  client_secret    = var.client_secret
+  tenant_id        = var.tenant_id
+  subscription_id  = var.subscription_id
 
-  os_type              = "Linux"
-  image_publisher      = "Canonical"
-  image_offer          = "UbuntuServer"
-  image_sku            = "18.04-LTS"
-  # Credentials for Azure
-  client_id            = var.client_id
-  client_secret        = var.client_secret
-  subscription_id      = var.subscription_id
-  tenant_id            = var.tenant_id
+  managed_image_resource_group_name = var.resource_group
+  managed_image_name                = "ubuntu-20-image"
+  location                          = var.location
+
+  shared_image_gallery_destination {
+  subscription        = var.subscription_id
+  resource_group      = var.resource_group
+  gallery_name        = var.compute_gallery_name
+  image_name          = var.compute_gallery_image_name
+  image_version       = var.compute_gallery_image_version
+  }
+
+  vm_size         = "Standard_D2s_v3"
+  communicator    = "ssh"
+  os_type         = "Linux"
+  image_publisher = "Canonical"
+  image_offer     = "0001-com-ubuntu-server-focal"
+  image_sku       = "20_04-lts-gen2"
+  image_version   = "latest"
+
+  azure_tags = {
+    Created-by = "Packer"
+    OS_Version = "Ubuntu 20.04"
+    Release    = "Latest"
+  }
 }
 
 build {
-  sources = ["source.azure-arm.example"]
+  sources = ["source.azure-arm.ubuntu_20"]
 
   provisioner "shell" {
     inline = [
-      "sudo apt-get update -y",
-      "sudo apt-get install -y nginx"
+      "sudo apt-get update",
+      "sudo apt-get upgrade -y",
+      "apt-get install ansible -y",
+      "sudo apt-get install -y python3-pip ansible",  # Install Ansible on the instance
+      "sudo ansible-galaxy collection install community.general",  # Install collection on the instance
     ]
   }
 }
+
 ```
 
 ### Packer Build Command
@@ -59,7 +84,7 @@ You can test the Packer template locally by running the following command:
 
 ```bash
 packer init .
-packer build -var 'client_id=your_client_id' -var 'client_secret=your_secret' template.pkr.hcl
+packer build -var 'client_id=your_client_id' -var 'client_secret=your_secret' ubuntu_20.pkr.hcl
 ```
 
 ### Ansible Integration (Future Work)
@@ -68,35 +93,57 @@ In the future, Ansible will be used for more advanced provisioning tasks, such a
 ## Azure DevOps Pipeline Setup
 
 ### Pipeline Configuration
-To automate the creation of the golden image, configure an ADO pipeline with Packer using the following YAML pipeline file (`azure-pipelines.yml`):
+To automate the creation of the golden image, configure an ADO pipeline with Packer using the following YAML pipeline file (`packer_build.yaml`):
 
 ```yaml
-trigger:
-  branches:
-    include:
-      - main
+name: $(BuildDefinitionName)_$(DayOfMonth).$(Month).$(Year:yyyy)$(Rev:.r)
 
-pool:
-  vmImage: 'ubuntu-latest'
+pr: none
+
+trigger: none
 
 variables:
-  ARM_CLIENT_ID: $(client_id)
-  ARM_CLIENT_SECRET: $(client_secret)
-  ARM_SUBSCRIPTION_ID: $(subscription_id)
-  ARM_TENANT_ID: $(tenant_id)
+  - group: vg-packer-poc
+  
+pool:
+  # name: $(pool_name)
+  vmImage: ubuntu-latest
+  
+stages :
+  - stage: packer_build
+    jobs:
+    - job: packer_build_job
+      #continueOnError: false
+      steps:
+        - checkout: self
+          fetchDepth: 25
 
-steps:
-- task: PackerInstaller@1
-  displayName: 'Install Packer'
+        - task: PackerTool@0
+          displayName: 'packer install'        
+          inputs:
+            version: '1.11.2'
 
-- script: |
-    packer init .
-    packer build -var "client_id=$(ARM_CLIENT_ID)" -var "client_secret=$(ARM_CLIENT_SECRET)" template.pkr.hcl
-  displayName: 'Build Image with Packer'
+        - task: Packer@1
+          displayName: 'packer init'
+          inputs:
+            connectedServiceType: 'azure'
+            azureSubscription: 'sp-tp-dev-01'
+            templatePath: './packer/linux/ubuntu/20_04_LTS/'
+            command: 'init'
+
+        - task: Packer@1
+          displayName: 'packer build'
+          inputs:
+            connectedServiceType: 'azure'
+            azureSubscription: 'sp-tp-dev-01'
+            templatePath: './packer/linux/ubuntu/20_04_LTS/'
+            command: 'build'
+            # variables:
+            #   var = '1'
 ```
 
 ### Variables
-Ensure the following variables are defined in the ADO pipeline:
+Ensure the following variables are passed from the ADO service connection to the packer task in the ADO pipeline:
 - `ARM_CLIENT_ID`: Azure service principal client ID.
 - `ARM_CLIENT_SECRET`: Service principal secret.
 - `ARM_SUBSCRIPTION_ID`: Subscription ID.
